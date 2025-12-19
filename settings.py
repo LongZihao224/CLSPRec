@@ -1,6 +1,9 @@
 task_name = 'Test'
 city = 'PHO'  # PHO, NYC, SIN
 gpuId = "cuda:0"
+seed = 2023
+batch_size = 1
+log_steps = 2
 
 enable_random_mask = True
 mask_prop = 0.1
@@ -9,6 +12,14 @@ enable_ssl = True  # whether enable contrastive learning
 enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
+use_gate = False
+use_contrastive = False
+neg_strategy = "random"  # random, hard
+hard_k = 5
+tau = 0.2
+use_aux_cat = False
+lambda_cl = 1.0
+lambda_cat = 1.0
 
 enable_dynamic_day_length = False
 sample_day_length = 14  # range [3,14]
@@ -51,3 +62,10 @@ else:
     output_file_name = output_file_name + "_" + "NoSSL"
 
 output_file_name = output_file_name + '_embeddingSize' + str(embed_size)
+
+if use_gate:
+    output_file_name = output_file_name + "_Gate"
+if use_contrastive:
+    output_file_name = output_file_name + "_CL-" + neg_strategy + f"-k{hard_k}-tau{tau}"
+if use_aux_cat:
+    output_file_name = output_file_name + f"_AuxCat-l{lambda_cat}"

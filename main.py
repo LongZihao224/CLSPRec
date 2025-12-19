@@ -7,6 +7,7 @@ import pickle
 import time
 import os
 import pandas as pd
+import math
 
 import settings
 from CLSPRec import CLSPRec
@@ -18,22 +19,96 @@ city = settings.city
 if settings.enable_ssl and settings.enable_distance_sample:
     df_farthest_POIs = pd.read_csv(f"./raw_data/{city}_farthest_POIs.csv")
 
+poi_coord_map = None
+poi_mapping_path = f"./raw_data/{city}_poi_mapping.csv"
+if os.path.isfile(poi_mapping_path):
+    df_poi_mapping = pd.read_csv(poi_mapping_path)
+    if {'latitude', 'longitude'}.issubset(df_poi_mapping.columns):
+        if 'VenueId' in df_poi_mapping.columns:
+            poi_coord_map = {
+                row['VenueId']: (row['latitude'], row['longitude'])
+                for _, row in df_poi_mapping.iterrows()
+            }
+        elif 'venueId' in df_poi_mapping.columns:
+            poi_coord_map = {
+                row['venueId']: (row['latitude'], row['longitude'])
+                for _, row in df_poi_mapping.iterrows()
+            }
 
-def generate_sample_to_device(sample):
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _haversine_distance(lat1, lon1, lat2, lon2):
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    c = 2 * math.asin(math.sqrt(a))
+    return 6371 * c
+
+
+def _compute_context(features_np, meta):
+    poi_seq = features_np[0]
+    cat_seq = features_np[1]
+    hour_seq = features_np[3]
+    day_seq = features_np[4]
+
+    last_hour = float(hour_seq[-1]) if len(hour_seq) > 0 else 0.0
+    last_day = float(day_seq[-1]) if len(day_seq) > 0 else 0.0
+    last_cat = float(cat_seq[-1]) if len(cat_seq) > 0 else 0.0
+
+    if len(hour_seq) >= 2:
+        delta_t = float(abs(hour_seq[-1] - hour_seq[-2]))
+    else:
+        delta_t = 0.0
+
+    delta_dist = 0.0
+    if poi_coord_map is not None and len(poi_seq) >= 2:
+        poi_mapping = meta.get("POI", None)
+        if poi_mapping is not None:
+            last_poi_id = poi_mapping[int(poi_seq[-1])]
+            prev_poi_id = poi_mapping[int(poi_seq[-2])]
+            if last_poi_id in poi_coord_map and prev_poi_id in poi_coord_map:
+                lat1, lon1 = poi_coord_map[prev_poi_id]
+                lat2, lon2 = poi_coord_map[last_poi_id]
+                delta_dist = float(_haversine_distance(lat1, lon1, lat2, lon2))
+
+    context = np.array([last_hour, last_day, delta_t, delta_dist, last_cat], dtype=np.float32)
+    return context
+
+
+def generate_sample_to_device(sample, meta):
     sample_to_device = []
     if settings.enable_dynamic_day_length:
         last_day = sample[-1][5][0]
         for seq in sample:
             seq_day = seq[5][0]
             if last_day - seq_day < settings.sample_day_length:
-                features = torch.tensor(seq[:5]).to(device)
+                features_list = seq[:5]
+                features_np = np.array(features_list, dtype=object)
+                context = _compute_context(features_np, meta)
+                features = torch.tensor(features_list).to(device)
                 day_nums = torch.tensor(seq[5]).to(device)
-                sample_to_device.append((features, day_nums))
+                label = torch.tensor(seq[6]).to(device) if len(seq) > 6 else None
+                sample_to_device.append((features, day_nums, torch.tensor(context).to(device), label))
     else:
-        for seq in sample:
-            features = torch.tensor(seq[:5]).to(device)
+        for idx, seq in enumerate(sample):
+            features_list = seq[:5]
+            features_np = np.array(features_list, dtype=object)
+            if idx == len(sample) - 1:
+                observed_features_np = np.array([feat[:-1] for feat in features_np], dtype=object)
+                context = _compute_context(observed_features_np, meta)
+            else:
+                context = _compute_context(features_np, meta)
+            features = torch.tensor(features_list).to(device)
             day_nums = torch.tensor(seq[5]).to(device)
-            sample_to_device.append((features, day_nums))
+            label = torch.tensor(seq[6]).to(device) if len(seq) > 6 else None
+            sample_to_device.append((features, day_nums, torch.tensor(context).to(device), label))
 
     return sample_to_device
 
@@ -74,7 +149,7 @@ def generate_negative_sample_list(dataset, user_id, current_POI):
     return neg_day_sample_to_device_list
 
 
-def train_model(train_set, test_set, h_params, vocab_size, device, run_name):
+def train_model(train_set, test_set, h_params, vocab_size, device, run_name, meta):
     torch.cuda.empty_cache()
     model_path = f"./results/{run_name}_model"
     log_path = f"./results/{run_name}_log"
@@ -122,27 +197,48 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name):
 
     loss_dict, recalls, ndcgs, maps = {}, {}, {}, {}
 
+    best_ndcg_10 = -1.0
     for epoch in range(start_epoch, h_params['epoch']):
         begin_time = time.time()
         total_loss = 0.
-        for sample in train_set:
-            sample_to_device = generate_sample_to_device(sample)
+        batch_size = settings.batch_size
+        for batch_start in range(0, len(train_set), batch_size):
+            batch_samples = train_set[batch_start:batch_start + batch_size]
+            batch_to_device = [generate_sample_to_device(sample, meta) for sample in batch_samples]
 
             neg_sample_to_device_list = []
-            if settings.enable_ssl:
-                user_id = sample[0][2][0]
-                current_POI = sample[-1][0][-2]
-                neg_sample_to_device_list = generate_negative_sample_list(train_set, user_id, current_POI)
+            if settings.enable_ssl and not settings.use_contrastive:
+                for sample in batch_samples:
+                    user_id = sample[0][2][0]
+                    current_POI = sample[-1][0][-2]
+                    neg_sample_to_device_list.append(
+                        generate_negative_sample_list(train_set, user_id, current_POI)
+                    )
 
-            loss, _ = rec_model(sample_to_device, neg_sample_to_device_list)
+            loss, metrics = rec_model.forward_batch(batch_to_device, neg_sample_to_device_list)
             total_loss += loss.detach().cpu()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            if batch_start < settings.log_steps * batch_size:
+                alpha_mean = metrics.get("alpha_mean", None)
+                alpha_var = metrics.get("alpha_var", None)
+                log_parts = [
+                    f"loss_poi={metrics['loss_poi'].item():.4f}",
+                    f"loss_cl={metrics['loss_cl'].item():.4f}",
+                    f"loss_cat={metrics['loss_cat'].item():.4f}",
+                ]
+                if alpha_mean is not None and alpha_var is not None:
+                    log_parts.append(f"alpha_mean={alpha_mean.item():.4f}")
+                    log_parts.append(f"alpha_var={alpha_var.item():.4f}")
+                if metrics.get("hard_neg_mean", None) is not None:
+                    log_parts.append(f"hard_neg_mean={metrics['hard_neg_mean'].item():.4f}")
+                print("step_log:", ", ".join(log_parts))
+
         # Test
-        recall, ndcg, map = test_model(test_set, rec_model)
+        recall, ndcg, map = test_model(test_set, rec_model, meta)
         recalls[epoch] = recall
         ndcgs[epoch] = ndcg
         maps[epoch] = map
@@ -157,6 +253,11 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name):
         meta_file = open(meta_path, 'wb')
         pickle.dump(epoch, meta_file)
         meta_file.close()
+
+        current_ndcg_10 = ndcg.get(10, 0).item() if isinstance(ndcg.get(10, 0), torch.Tensor) else ndcg.get(10, 0)
+        if current_ndcg_10 > best_ndcg_10:
+            best_ndcg_10 = current_ndcg_10
+            torch.save(rec_model.state_dict(), f"{model_path}_best")
 
         # Early stop
         past_10_loss = list(loss_dict.values())[-11:-1]
@@ -174,7 +275,7 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name):
     print("============================")
 
 
-def test_model(test_set, rec_model, ks=[1, 5, 10]):
+def test_model(test_set, rec_model, meta, ks=[1, 5, 10]):
     def calc_recall(labels, preds, k):
         return torch.sum(torch.sum(labels == preds[:, :k], dim=1)) / labels.shape[0]
 
@@ -190,10 +291,10 @@ def test_model(test_set, rec_model, ks=[1, 5, 10]):
 
     preds, labels = [], []
     for sample in test_set:
-        sample_to_device = generate_sample_to_device(sample)
+        sample_to_device = generate_sample_to_device(sample, meta)
 
         neg_sample_to_device_list = []
-        if settings.enable_ssl:
+        if settings.enable_ssl and not settings.use_contrastive:
             user_id = sample[0][2][0]
             current_POI = sample[-1][0][-2]
             neg_sample_to_device_list = generate_negative_sample_list(test_set, user_id, current_POI)
@@ -246,6 +347,8 @@ if __name__ == '__main__':
     meta = pickle.load(file)
     file.close()
 
+    seed_everything(settings.seed)
+
     vocab_size = {"POI": torch.tensor(len(meta["POI"])).to(device),
                   "cat": torch.tensor(len(meta["cat"])).to(device),
                   "user": torch.tensor(len(meta["user"])).to(device),
@@ -281,7 +384,7 @@ if __name__ == '__main__':
         run_name = f'{settings.output_file_name} {run_num}'
         print(run_name)
 
-        train_model(train_set, valid_set, h_params, vocab_size, device, run_name=run_name)
+        train_model(train_set, valid_set, h_params, vocab_size, device, run_name=run_name, meta=meta)
         print_output_to_file(settings.output_file_name, run_num)
 
         t = random.randint(1, 9)
