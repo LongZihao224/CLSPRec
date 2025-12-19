@@ -399,6 +399,19 @@ def reshape_data(original_data):
     return result
 
 
+def append_next_category_label(data):
+    """Append next-category label to each sequence in a sample.
+
+    The label is derived from the last element of the category sequence.
+    """
+    for sample in data:
+        for seq in sample:
+            if len(seq) < 7:
+                next_category = seq[1][-1]
+                seq.append(next_category)
+    return data
+
+
 def dump_data(data, city, data_type):
     """save data as pickle file
 
@@ -500,10 +513,10 @@ def generate_data(city):
     print("date sequence generated.")
 
     # Reshape data: [features * sample * sequence] -> [sample * sequence * features]
-    train_data = reshape_data(train_data)
-    valid_data = reshape_data(valid_data)
-    test_data = reshape_data(test_data)
-    train_valid_data = reshape_data(train_valid_data)
+    train_data = append_next_category_label(reshape_data(train_data))
+    valid_data = append_next_category_label(reshape_data(valid_data))
+    test_data = append_next_category_label(reshape_data(test_data))
+    train_valid_data = append_next_category_label(reshape_data(train_valid_data))
 
     # Meta data
     meta_data["POI"] = poi_mapping
