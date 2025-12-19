@@ -405,10 +405,12 @@ def append_next_category_label(data):
     The label is derived from the last element of the category sequence.
     """
     for sample in data:
-        for seq in sample:
-            if len(seq) < 7:
-                next_category = seq[1][-1]
-                seq.append(next_category)
+        if not sample:
+            continue
+        short_seq = sample[-1]
+        if len(short_seq) >= 2 and len(short_seq[1]) > 0 and len(short_seq) < 7:
+            next_category = short_seq[1][-1]
+            short_seq.append(next_category)
     return data
 
 
@@ -420,7 +422,10 @@ def dump_data(data, city, data_type):
         city (str): city code for file naming
         data_type (str): data description for file naming
     """
-    directory = './processed_data'
+    if settings.enable_dynamic_day_length:
+        directory = './processed_data/dynamic_day_length'
+    else:
+        directory = './processed_data/original'
     if not os.path.exists(directory):
         os.makedirs(directory)
     file_path = directory + "/{}_{}"

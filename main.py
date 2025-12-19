@@ -86,12 +86,16 @@ def generate_sample_to_device(sample, meta):
     sample_to_device = []
     if settings.enable_dynamic_day_length:
         last_day = sample[-1][5][0]
-        for seq in sample:
+        for idx, seq in enumerate(sample):
             seq_day = seq[5][0]
             if last_day - seq_day < settings.sample_day_length:
                 features_list = seq[:5]
                 features_np = np.array(features_list, dtype=object)
-                context = _compute_context(features_np, meta)
+                if idx == len(sample) - 1:
+                    observed_features_np = np.array([feat[:-1] for feat in features_np], dtype=object)
+                    context = _compute_context(observed_features_np, meta)
+                else:
+                    context = _compute_context(features_np, meta)
                 features = torch.tensor(features_list).to(device)
                 day_nums = torch.tensor(seq[5]).to(device)
                 label = torch.tensor(seq[6]).to(device) if len(seq) > 6 else None
